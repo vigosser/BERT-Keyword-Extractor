@@ -5,14 +5,19 @@ import argparse
 import numpy as np
 import pandas as pd
 from nltk.tokenize import sent_tokenize
+import nltk
+import progressbar
+from seqevl_util import seqeval_util
+from seqeval.metrics import f1_score, accuracy_score, precision_score, recall_score
 import re
+nltk.download('punkt')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 parser = argparse.ArgumentParser(description='BERT Keyword Extractor')
 parser.add_argument('--sentence', type=str, default=' ',
                     help='sentence to get keywords')
-parser.add_argument('--path', type=str, default='model.pt',
+parser.add_argument('--path', type=str, default='/workdir/data/en_model.pt',
                     help='path to load model')
 parser.add_argument('--lang', type=str, default='en',
                     help='path to save the final model')
@@ -24,7 +29,7 @@ elif args.lang == "cn":
     bert_model = "bert-base-chinese"
     model_path = "/workdir/pretrain-model/bert-torch-cn"
 bert_model = "bert-base-uncased"
-model_path = "D:/Github/BERT-Keyword-Extractor/model/en_model.pt"
+# model_path = "D:/Github/BERT-Keyword-Extractor/model/en_model.pt"
 tag2idx = {'B': 0, 'I': 1, 'O': 2}
 tags_vals = ['B', 'I', 'O']
 
@@ -45,29 +50,34 @@ def casting(tkns, prediction):
                 backward = False
                 for i in range(int(len(tkns) / 2)):
                     # forward
-                    if not tkns[k - i].find('##') == -1:
-                        prediction[k - i] = 1
-                    else:
-                        prediction[k - i] = 0
-                        forwd = True
+                    if k-i>=0:
+                        if not tkns[k - i].find('##') == -1:
+                            prediction[k - i] = 1
+                        else:
+                            prediction[k - i] = 0
+                            forwd = True
                     # backward
-                    if tkns[k + i].find('##') == -1:
-                        prediction[k + i] = 1
-                    else:
-                        backward = True
-                    if forwd & backward:
-                        break
+                    if k+i<len(tkns):
+                        if tkns[k + i].find('##') == -1:
+                            prediction[k + i] = 1
+                        else:
+                            backward = True
+                        if forwd & backward:
+                            break
     peases = []
     begin = False
     for k, j in enumerate(prediction):
         if j == 0 or j == 1:
+            # 1后面跟了一个0.
+            if j==0 and begin==True:
+                peases.append(';')
             begin = True
             # 有#的话是拼接
             if tkns[k].find('##') != -1:
                 peases[len(peases) - 1] = peases[len(peases) - 1] + tkns[k].replace('#', '')
             else:
                 peases.append(tkns[k])
-        if j == 2 and prediction[k - 1] == 1 and begin==True:
+        if j == 2 and prediction[k - 1] != 2 and begin==True:
             begin = False
             peases.append(';')
     return ' '.join(peases)
@@ -83,7 +93,7 @@ def keywordextract(sentence, model):
     # tkns=sent_tokenize(text)
     # tkns= tokenizer.basic_tokenizer.tokenize(text)
     tkns = tokenizer.tokenize(text)
-    print(tkns)
+    # print(tkns)
     indexed_tokens = tokenizer.convert_tokens_to_ids(tkns)
     segments_ids = [0] * len(tkns)
     tokens_tensor = torch.tensor([indexed_tokens]).to(device)
@@ -111,28 +121,31 @@ def keywordextract(sentence, model):
     #     elif flag == True:
     #         result = result + "; "
     #         flag = False
-    print(result)
+    # print(result)
     return result, prediction
 
 
 data = pd.DataFrame(pd.read_excel('D:/Github/BERT-Keyword-Extractor/GKB_doc/GRB_sample_clear.xlsx', encoding='utf8'))
+# data = pd.DataFrame(pd.read_excel('/workdir/data/GRB_sample_clear.xlsx', encoding='utf8'))
 en_text = data.values[:, 6]
 en_tag = data.values[:, 5]
 data['result_en'] = ""
 data['result_en_prediction'] = ""
 args.path = 'D:/Github/BERT-Keyword-Extractor/model/en_model.pt'
 model = torch.load(args.path, map_location=device)
-for i in range(0, len(en_text)):
-    data['result_en'][i]
-    input = ""
+with progressbar.ProgressBar(max_value=100) as bar:
+    for i in range(0, len(en_text)):
+        data['result_en'][i]
+        input = ""
 
-    if len(en_text[i]) >= 512:
-        input = en_text[i][0:512]
-    else:
-        input = en_text[i]
-    sentens = sent_tokenize(input)
-    res, predictions = keywordextract(input, model)
-    data['result_en'][i] = res
-    data['result_en_prediction'][i] = predictions
+        if len(en_text[i]) >= 512:
+            input = en_text[i][0:512]
+        else:
+            input = en_text[i]
+        sentens = sent_tokenize(input)
+        res, predictions = keywordextract(input, model)
+        data['result_en'][i] = res
+        data['result_en_prediction'][i] = predictions
+        bar.update(round(i / len(data), 6) * 100)
 
-data.to_excel("D:/Github、BERT-Keyword-Extractor/GKB_doc/cn_finalresult.xlsx")
+data.to_excel("D:/Github/BERT-Keyword-Extractor/GKB_doc/diction_bert.xlsx")

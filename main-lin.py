@@ -27,6 +27,8 @@ from pytorch_pretrained_bert import BertTokenizer, BertConfig
 from pytorch_pretrained_bert import BertForTokenClassification, BertAdam
 import re
 import progressbar
+import pickle
+from seqeval.metrics import f1_score, accuracy_score, precision_score, recall_score
 
 tag2idx = {'B': 0, 'I': 1, 'O': 2}
 tags_vals = ['B', 'I', 'O']
@@ -35,11 +37,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 n_gpu = torch.cuda.device_count()
 
 parser = argparse.ArgumentParser(description='BERT Keyword Extraction Model')
-parser.add_argument('--data', type=str, default='/workdir/data/GRB_all.xlsx',
+parser.add_argument('--data', type=str, default='/workdir/data/GRB_training_text_en_all.xlsx',
                     help='location of the data corpus')
 parser.add_argument('--epochs', type=int, default=4,
                     help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=64, metavar='N',
+parser.add_argument('--batch_size', type=int, default=16, metavar='N',
                     help='batch size')
 parser.add_argument('--seq_len', type=int, default=512, metavar='N',
                     help='sequence length')
@@ -49,15 +51,17 @@ parser.add_argument('--save', type=str, default='/workdir/data/en_model.pt',
                     help='path to save the final model')
 parser.add_argument('--lang', type=str, default='en',
                     help='path to save the final model')
-
 parser.add_argument('--result_path', type=str, default='/workdir/result.txt',
                     help='path to the result')
+parser.add_argument('--key_path', type=str, default='/workdir/githc/b-k-e/GKB_doc/tag_count_all.csv',
+                    help='path to the key_dictionary')
+parser.add_argument('--temp_path', type=str, default='/workdir/temp',
+                    help='path to the key_dictionary')
 
 args = parser.parse_args()
 MAX_LEN = args.seq_len
 bs = args.batch_size
 utiler.set_csvpath(args.result_path)
-bert_model = ""
 if args.lang == "en":
     bert_model = "bert-base-uncased"
 elif args.lang == "cn":
@@ -65,7 +69,12 @@ elif args.lang == "cn":
 elif args.lang == "mutil":
     bert_model = "bert-base-multilingual-uncased"
 bert_model = 'bert-base-uncased'
-args.data = 'D:/Github/BERT-Keyword-Extractor/GKB_doc/GRB_sample_clear.xlsx'
+args.data = 'D:/Github/BERT-Keyword-Extractor/GKB_doc/GRB_training_text_en_all.xlsx'
+args.key_path = 'D:/Github/BERT-Keyword-Extractor/GKB_doc/tag_count_all.csv'
+args.temp_path='D:/Github/BERT-Keyword-Extractor'
+args.usedict=True
+data = pd.DataFrame(pd.read_excel(args.data))
+key_d = pd.DataFrame(pd.read_csv(args.key_path)).values[:, 0]
 
 
 def flat_accuracy(preds, labels):
@@ -86,26 +95,57 @@ def flat_accuracy(preds, labels):
     return np.sum(pred_flat == labels_flat) / len(labels_flat)
 
 
-
 def extend_single(labels, sentences, tokenizer):
-    words=[]
+    words = []
     for i in range(len(labels)):
         sent = word_tokenize(sentences[i])
         moves = 0
         for j, word in enumerate(sent):
             tk_words = tokenizer.tokenize(word)
-            words=words+tk_words
+            words = words + tk_words
             if len(tk_words) != 1:
                 for add in range(len(tk_words) - 1):
-                    labels[i].insert(j +1 + moves, 'I' if labels[i][j + moves] != 'O' else 'O')
+                    labels[i].insert(j + 1 + moves, 'I' if labels[i][j + moves] != 'O' else 'O')
             moves = moves + len(tk_words) - 1
 
     return labels, words
 
 
+def convert_with_diction(sentence):
+    token = sentence
+    key_sent = []
+    labels = []
+    # for token in tokens:
+    sent = word_tokenize(token.lower())
+    z = ['O'] * len(sent)
+    for k in key_d:
+        if k in token:
+            k = k.lower()
+            if len(k.split()) == 1:
+                try:
+                    z[sent.index(k.split()[0])] = 'B'
+                except ValueError:
+                    continue
+            elif len(k.split()) > 1:
+                try:
+                    if sent.index(k.split()[0]) and sent.index(
+                            k.split()[-1]):
+                        z[sent.index(k.split()[0])] = 'B'
+                        for j in range(1, len(k.split())):
+                            z[sent.index(k.split()[j])] = 'I'
+                except ValueError:
+                    continue
+    for m, n in enumerate(z):
+        if z[m] == 'I' and z[m - 1] == 'O':
+            z[m] = 'O'
+    labels.append(z)
+    key_sent.append(token)
+    return key_sent, labels
+
+
 def convert(sentence, key):
     # tokens = sent_tokenize(sentence)
-    token=sentence
+    token = sentence
     keys = str(key).split(';')
     key_sent = []
     labels = []
@@ -137,68 +177,61 @@ def convert(sentence, key):
     return key_sent, labels
 
 
-data = pd.DataFrame(pd.read_excel(args.data))
-
 sentences_all = []
 labels_all = []
-input_ids_all=[]
-tokenizer = BertTokenizer.from_pretrained(bert_model, do_lower_case=True)
-# cache_dir='/workdir/pretrain-model/bert-torch')
-def to_sentence(sentences_):
-    pathh='./GKB_doc/sentence.txt'
-    sent=''
-    for i in sentences_:
-        sent=sent+i+' '
-    utiler.save_txt(sent,pathh)
+input_ids_all = []
+tokenizer = BertTokenizer.from_pretrained(bert_model, do_lower_case=True, cache_dir=utiler.cache_dir)
 
-def to_tags(labels_):
-    pathh2 = './GKB_doc/tag.txt'
-    sent = ''
-    for i in labels_:
-        sent = sent + i + ' '
-    utiler.save_txt(sent, pathh2)
-
-with progressbar.ProgressBar(max_value=100) as bar:
-    for i in range(len(data)):
-        sentences_ = []
-        labels_ = []
-        input_ids=[]
-        bar.update(i/len(data)*100)
-        cop = re.compile("[^ !#$%&\'()*+,-./:;<=>?\\^_`{|}~^a-z^A-Z^0-9]")
-        en_text = data.values[i, 6].replace('``', '').replace("\"",'').replace('\uf06c','')
-        en_tag = data.values[i, 5]
-        tokens = sent_tokenize(en_text)
-        for iii, text in enumerate(tokens):
-            text=cop.sub("",text) ## replace unnecessary char.
-            s, l = convert(text, en_tag)
-            l, tks = extend_single(l, s, tokenizer)
-            # ids=[tokenizer.convert_tokens_to_ids(txt) for txt in tks]
-            # if len(tks) != len(l_e[0]): # 校验是否有句子与标签长度不匹配
-            #     print(s)
-            #     print(tks)
-            #     print(i)
-            #     print(iii)
-            # sentences_.append(tks)
-            # labels_.append(l)
-            sentences_ = sentences_ + tks
-            labels_ = labels_ + l[0]
-            # input_ids=input_ids+ids
-        to_sentence(sentences_)
-        to_tags(labels_)
-        sentences_all.append(sentences_)
-        labels_all.append(labels_)
-        input_ids_all.append(input_ids)
-
-
-# input_ids = pad_sequences([tokenizer.convert_tokens_to_ids(txt) for txt in tokenized_texts],
-#                           maxlen=MAX_LEN, dtype="long", truncating="post", padding="post")
-# tags = pad_sequences([[tag2idx.get(l) for l in lab] for lab in labels],
-#                      maxlen=MAX_LEN, value=tag2idx["O"], padding="post",
-#                      dtype="long", truncating="post")
+if  os.path.exists(args.temp_path+'/sentence_all.pkl'):
+    with progressbar.ProgressBar(max_value=100) as bar:
+        for i in range(len(data)):
+            sentences_ = []
+            labels_ = []
+            input_ids = []
+            bar.update(i / len(data) * 100)
+            cop = re.compile("[^ !#$%&\'()*+,-./:;<=>?\\^_`{|}~^a-z^A-Z^0-9]")
+            html_sub = re.compile('<\\/?.+?\\/?>')  # html标签
+            if data.values[i, 8] != data.values[i, 8]:
+                continue
+            en_text = data.values[i, 8].replace('``', '').replace("\"", '').replace('\uf06c', '')
+            tokens = sent_tokenize(en_text)
+            for iii, text in enumerate(tokens):
+                text = cop.sub("", text)  ## replace unnecessary char.
+                text = html_sub.sub("", text)
+                if args.usedict:
+                    s, l = convert_with_diction(text)
+                else:
+                    s,l = convert(text,)
+                l, tks = extend_single(l, s, tokenizer)
+                ids = tokenizer.convert_tokens_to_ids(tks)
+                assert len(tks) == len(l[0])
+                assert len(ids) == len(l[0])
+                sentences_ = sentences_ + tks
+                labels_ = labels_ + l[0]
+                input_ids = input_ids + ids
+            if not 'B' in labels_ and not 'I' in labels_:
+                continue
+            sentences_all.append(sentences_)
+            labels_all.append(labels_)
+            input_ids_all.append(input_ids)
+    utiler.save_variable(sentences_all, args.temp_path+'/sentence_all.pkl')
+    utiler.save_variable(labels_all, args.temp_path+'/labels_all.pkl')
+    utiler.save_variable(input_ids_all, args.temp_path+'/input_ids_all.pkl')
+    df = pd.DataFrame(columns=['sentence', 'labels'])
+    df['sentence'] = sentences_all
+    df['labels'] = labels_all
+    df.to_excel('temp_all.xlsx')
+else:
+    sentences_all = utiler.load_variavle(args.temp_path+'/sentence_all.pkl')
+    labels_all = utiler.load_variavle(args.temp_path+'/labels_all.pkl')
+    input_ids_all = utiler.load_variavle(args.temp_path+'/input_ids_all.pkl')
+input_ids = pad_sequences(input_ids_all, maxlen=MAX_LEN, dtype="long", truncating="post", padding="post")
+tags = pad_sequences([[tag2idx.get(l) for l in lab] for lab in labels_all], maxlen=MAX_LEN, value=tag2idx["O"],
+                     padding="post", dtype="long", truncating="post")
 
 attention_masks = [[float(i > 0) for i in ii] for ii in input_ids]
 
-tr_inputs, val_inputs, tr_tags, val_tags = train_test_split(input_ids_all, labels_all,
+tr_inputs, val_inputs, tr_tags, val_tags = train_test_split(input_ids, tags,
                                                             random_state=2018, test_size=0.1)
 tr_masks, val_masks, _, _ = train_test_split(attention_masks, input_ids,
                                              random_state=2018, test_size=0.1)
@@ -218,9 +251,10 @@ valid_data = TensorDataset(val_inputs, val_masks, val_tags)
 valid_sampler = SequentialSampler(valid_data)
 valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=bs)
 
-model = BertForTokenClassification.from_pretrained(bert_model, num_labels=len(tag2idx))
+model = BertForTokenClassification.from_pretrained(bert_model, num_labels=len(tag2idx),cache_dir=utiler.cache_dir)
 
 model = model.cuda()
+# model = torch.nn.DataParallel(model)
 
 FULL_FINETUNING = True
 if FULL_FINETUNING:
@@ -236,8 +270,6 @@ else:
     param_optimizer = list(model.classifier.named_parameters())
     optimizer_grouped_parameters = [{"params": [p for n, p in param_optimizer]}]
 optimizer = Adam(optimizer_grouped_parameters, lr=args.lr)
-
-from seqeval.metrics import f1_score, accuracy_score, precision_score, recall_score
 
 epochs = args.epochs
 max_grad_norm = 1.0
